@@ -100,6 +100,13 @@ class TeleoperateConfig:
     # in the headset cannot see the calibration state of the chain.
     preflight: bool = True
 
+    # [xr] In-headset HUD (--hud=false to skip): mirrors the preflight instructions,
+    # pose-lost warnings, and clutch state onto a Televiz quad layer inside the CloudXR
+    # session — the operator cannot read the terminal from inside the headset. Needs an
+    # isaacteleop wheel built with BUILD_VIZ=ON; silently falls back to terminal-only
+    # output when ``isaacteleop.viz`` is unavailable.
+    hud: bool = True
+
 
 @parser.wrap()
 def teleoperate(cfg: TeleoperateConfig):

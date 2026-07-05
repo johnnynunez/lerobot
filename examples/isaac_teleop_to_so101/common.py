@@ -70,6 +70,7 @@ from lerobot.utils.constants import HF_LEROBOT_CALIBRATION, HF_LEROBOT_HOME, TEL
 from lerobot.utils.robot_utils import precise_sleep
 
 try:
+    from .hud import HudClient
     from .preflight import (
         PreflightConfig,
         PreflightGame,
@@ -78,6 +79,7 @@ try:
         run_blocking,
     )
 except ImportError:  # run directly as a script (no parent package)
+    from hud import HudClient
     from preflight import (
         PreflightConfig,
         PreflightGame,
@@ -111,6 +113,7 @@ class LoopConfig(Protocol):
     align: bool
     align_duration: float
     preflight: bool
+    hud: bool
 
 
 # Per-device bundle consumed by the shared loop. ``compute`` returns None to mean
@@ -414,6 +417,16 @@ def setup_xr(cfg: LoopConfig, robot, motor_names: list[str]) -> Device:
     # so recovery is jump-free by construction.
     pose_gate = PoseGate()
 
+    # In-headset HUD (Televiz): the operator cannot read the terminal from inside the
+    # headset, so preflight instructions / pose-lost warnings / clutch state are ALSO
+    # rendered on a quad layer in the CloudXR session. Spawned in startup() AFTER
+    # connect() (the subprocess inherits the CloudXR runtime env); strictly best-effort.
+    hud: HudClient | None = None
+
+    def _hud_send(state: dict) -> None:
+        if hud is not None:
+            hud.send(state)
+
     # Haptic mirror of the preflight events: pass/fail/done pulses the operator FEELS —
     # the terminal is invisible from inside the headset. Queued via send_feedback and
     # applied on the device's next get_action() step.
@@ -466,12 +479,15 @@ def setup_xr(cfg: LoopConfig, robot, motor_names: list[str]) -> Device:
         print(f"[preflight] ✓ follower: {detail}")
 
     def startup() -> None:
-        nonlocal clutch
+        nonlocal clutch, hud
         # Connect and wait for the operator to don the headset BEFORE moving the arm, so the
         # reset slew happens while they are watching in VR.
         teleop_device.connect()
         if not teleop_device.is_connected:
             raise ValueError("Teleop is not connected!")
+        if getattr(cfg, "hud", True):
+            hud = HudClient.spawn()  # after connect(): inherits the CloudXR runtime env
+        _hud_send({"phase": "connect", "instruction": "Connect the headset and press Play."})
         _wait_for_xr_controller(teleop_device)
 
         if cfg.preflight:
@@ -479,8 +495,16 @@ def setup_xr(cfg: LoopConfig, robot, motor_names: list[str]) -> Device:
             # (gripper-only wiggle), all BEFORE the reset slew — the slew is the first
             # large motion, so everything must already be proven when it runs.
             game.arm("startup — verify the headset, controller, and follower before any motion")
-            run_blocking(game, teleop_device, FPS)
+            run_blocking(game, teleop_device, FPS, status_cb=_hud_send)
             _apply_yaw_alignment()
+            _hud_send(
+                {
+                    "phase": "follower",
+                    "severity": "info",
+                    "instruction": "Checking the follower arm…",
+                    "detail": "Watch the gripper: it should wiggle and return.",
+                }
+            )
             _run_follower_check()
 
         if cfg.reset_to_origin:
@@ -489,6 +513,14 @@ def setup_xr(cfg: LoopConfig, robot, motor_names: list[str]) -> Device:
             source = str(reset_pose_file) if reset_pose_file.exists() else "hardcoded defaults"
             print(f"Reset target source: {source}")
             print(f"Resetting to origin over {cfg.reset_duration:.1f} s…")
+            _hud_send(
+                {
+                    "phase": "reset",
+                    "severity": "warn",
+                    "instruction": "The arm is moving to its reset pose.",
+                    "detail": f"Stay clear — {cfg.reset_duration:.0f} s slew.",
+                }
+            )
             slew(robot, motor_names, lambda: target, cfg.reset_duration)
             print("Reset complete.")
 
@@ -499,6 +531,13 @@ def setup_xr(cfg: LoopConfig, robot, motor_names: list[str]) -> Device:
         home_base_T_ee = kinematics_solver.forward_kinematics(q_measured_deg)  # noqa: N806
         clutch = Clutch(home_base_T_ee)
 
+        _hud_send(
+            {
+                "phase": "teleop",
+                "engaged": False,
+                "detail": "Squeeze the grip to engage; the trigger drives the gripper.",
+            }
+        )
         print("Starting teleop loop. Squeeze and move the controller to teleoperate the robot...")
 
     def compute(robot_obs: RobotObservation | None) -> RobotAction | None:
@@ -525,8 +564,14 @@ def setup_xr(cfg: LoopConfig, robot, motor_names: list[str]) -> Device:
                     prev_enabled = False
                 tracking_lost_since = None
             if game.active:
-                if game.step(xr_action, tracking and teleop_device.pose_valid):
+                trusted = tracking and teleop_device.pose_valid
+                if game.step(xr_action, trusted):
                     _apply_yaw_alignment()  # re-align on every passed preflight (each Play)
+                    _hud_send({"phase": "teleop", "engaged": False, "detail": "Preflight passed."})
+                else:
+                    state = game.hud_state(waiting=not trusted)
+                    if state is not None:  # dedupe in HudClient makes the per-frame send cheap
+                        _hud_send(state)
                 return None  # hold the measured pose while the game runs
 
         grip_pos = np.asarray(xr_action["grip_pos"], dtype=float)
@@ -545,6 +590,14 @@ def setup_xr(cfg: LoopConfig, robot, motor_names: list[str]) -> Device:
         if verdict != "ok":
             now = time.monotonic()
             periodic = tracking and now - last_status_t >= STATUS_PERIOD_S
+            _hud_send(
+                {
+                    "phase": "pose_lost",
+                    "severity": "error",
+                    "instruction": "Controller pose lost — arm held.",
+                    "detail": "Bring the controller back into the headset's view and squeeze again.",
+                }
+            )
             if prev_enabled:
                 teleop_device.send_feedback(HAPTIC_POSE_LOST)
                 print(
@@ -581,6 +634,8 @@ def setup_xr(cfg: LoopConfig, robot, motor_names: list[str]) -> Device:
         # One-line telemetry at STATUS_PERIOD_S: where the controller is/points, whether
         # the clutch is engaged, and how far the commanded target leads the arm. This is
         # the "why is it not doing what I want" panel — a spectator can read it aloud.
+        # The same snapshot refreshes the in-headset HUD (coarsely quantized values so
+        # the dedupe in HudClient keeps idle frames free).
         now = time.monotonic()
         if tracking and now - last_status_t >= STATUS_PERIOD_S:
             last_status_t = now
@@ -592,10 +647,18 @@ def setup_xr(cfg: LoopConfig, robot, motor_names: list[str]) -> Device:
                 f"[teleop] ctrl xyz=({grip_pos[0]:+.2f},{grip_pos[1]:+.2f},{grip_pos[2]:+.2f})m "
                 f"yaw={yaw:+4.0f} pitch={pitch:+4.0f} deg | {state} | trig {trigger:.2f}"
             )
+            hud_state = {
+                "phase": "teleop",
+                "engaged": enabled,
+                "squeeze": round(squeeze, 1),
+                "trigger": round(trigger, 1),
+            }
             if enabled and measured_pos is not None:
                 lead = float(np.linalg.norm(clutch.last_commanded_pos - measured_pos))
                 line += f" | target leads arm {lead * 100:.1f} cm"
+                hud_state["lead_cm"] = round(lead * 100, 1)
             print(line, flush=True)
+            _hud_send(hud_state)
 
         # SAFETY GATE: command the robot ONLY while the clutch is engaged; otherwise return
         # None so the loop holds the measured joints (releasing the clutch freezes the arm).
@@ -626,7 +689,12 @@ def setup_xr(cfg: LoopConfig, robot, motor_names: list[str]) -> Device:
             _send_grip_haptic(teleop_device, robot_action, robot_obs)
         return robot_action
 
-    return Device(compute=compute, startup=startup, cleanup=teleop_device.disconnect)
+    def cleanup() -> None:
+        if hud is not None:
+            hud.close()
+        teleop_device.disconnect()
+
+    return Device(compute=compute, startup=startup, cleanup=cleanup)
 
 
 # Gripper stall [RANGE_0_100 units] where rumble starts (below = free-motion tracking lag)

@@ -126,6 +126,24 @@ class PreflightGame:
         """True while the game is running and the loop must hold the arm."""
         return self._active
 
+    def hud_state(self, waiting: bool = False) -> dict | None:
+        """Current game state as an in-headset HUD payload (None once the game passed).
+
+        Pure and side-effect free — the owning loop forwards it to the HUD channel it
+        has (the terminal mirror stays in :meth:`step`'s prints).
+        """
+        if not self._active:
+            return None
+        _, instruction = self._checks[self._idx]
+        return {
+            "phase": "preflight",
+            "instruction": instruction,
+            "checks_done": self._idx,
+            "checks_total": len(self._checks),
+            "attempt": self._attempt,
+            "waiting": waiting,
+        }
+
     def arm(self, reason: str) -> None:
         """(Re-)start the game from the first check."""
         self._active = True
@@ -327,7 +345,7 @@ class PreflightGame:
                 return True, "trigger cycles full range"
 
 
-def run_blocking(game: PreflightGame, teleop_device, fps: int) -> None:
+def run_blocking(game: PreflightGame, teleop_device, fps: int, status_cb=None) -> None:
     """Drive the game from the device's own stream until it passes (startup path).
 
     Blocking is safe here: nothing has commanded the arm yet and the follower's servos
@@ -336,11 +354,18 @@ def run_blocking(game: PreflightGame, teleop_device, fps: int) -> None:
     A tracked-but-invalid pose (controller out of the headset's camera view — the
     runtime streams an IMU-extrapolated ghost) counts as NOT tracking, so ghost frames
     pause the checks instead of feeding them garbage.
+
+    ``status_cb`` (optional) receives :meth:`PreflightGame.hud_state` once per frame —
+    the hook for mirroring progress to an in-headset HUD.
     """
     while game.active:
         action = teleop_device.get_action()
         trusted = teleop_device.is_tracking and getattr(teleop_device, "pose_valid", True)
         game.step(action, trusted)
+        if status_cb is not None:
+            state = game.hud_state(waiting=not trusted)
+            if state is not None:
+                status_cb(state)
         precise_sleep(1.0 / fps)
 
 
