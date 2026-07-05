@@ -44,13 +44,22 @@ from lerobot.robots.so_follower import SOFollowerConfig  # noqa: F401  (register
 from lerobot.teleoperators.isaac_teleop import IsaacTeleopConfig
 from lerobot.utils.robot_utils import precise_sleep
 
-from .common import (
-    ALIGN_DURATION_S,
-    FPS,
-    RESET_DURATION_S,
-    build_device,
-    hold_action,
-)
+try:
+    from .common import (
+        ALIGN_DURATION_S,
+        FPS,
+        RESET_DURATION_S,
+        build_device,
+        hold_action,
+    )
+except ImportError:  # run directly as a script (no parent package)
+    from common import (
+        ALIGN_DURATION_S,
+        FPS,
+        RESET_DURATION_S,
+        build_device,
+        hold_action,
+    )
 
 
 @dataclass
@@ -84,6 +93,12 @@ class TeleoperateConfig:
     align: bool = True
     # [leader] Duration [s] of the startup alignment slew.
     align_duration: float = ALIGN_DURATION_S
+
+    # [xr] Guided pre-flight "calibration game" (--preflight=false to skip): proves the
+    # controller stream, tracking stability, motion scale, clutch, trigger, and the follower's
+    # servo bus before ANY motion — and again on every VR Play/resume edge, since the operator
+    # in the headset cannot see the calibration state of the chain.
+    preflight: bool = True
 
 
 @parser.wrap()

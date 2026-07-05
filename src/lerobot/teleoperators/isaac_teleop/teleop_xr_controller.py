@@ -43,6 +43,9 @@ if TYPE_CHECKING:
 # ``TeleopSession.step(external_inputs=...)`` each frame.
 _BASE_T_ANCHOR_INPUT = "base_T_anchor"
 
+# Source-node name for the per-frame haptic pulse fed the same way (see send_feedback).
+_HAPTIC_INPUT = "haptic_pulse"
+
 
 class XRController(IsaacTeleopTeleoperator):
     """Raw XR controller grip-pose teleoperator (base-frame), no retargeters.
@@ -65,6 +68,20 @@ class XRController(IsaacTeleopTeleoperator):
         # Whether the last get_action() read a tracked controller; the owning loop polls this
         # to wait for the operator to connect before driving the arm.
         self._is_tracking = False
+        # Whether the runtime flagged the last grip pose as VALID. Tracked but not valid
+        # happens when the controller leaves the headset's camera view: the runtime keeps
+        # streaming an IMU-extrapolated "ghost" pose that later snaps back. The owning
+        # loop must not integrate such frames into the clutch.
+        self._pose_valid = False
+        # ControllersSource built in _build_pipeline; its tracker is shared with the
+        # haptic sink so the session creates a single controller tracker.
+        self._controllers = None
+        # Pending haptic pulse [amplitude, frequency_hz, duration_s], written by
+        # send_feedback() and flushed into the haptic TensorGroup on the next step.
+        self._haptic_pulse = np.zeros(3, dtype=np.float32)
+        self._haptic_pending = False
+        # TensorGroup feeding the haptic sink's ValueInput; built in connect().
+        self._haptic_group = None
 
     # ------------------------------------------------------------------
     # Pipeline construction
@@ -82,6 +99,7 @@ class XRController(IsaacTeleopTeleoperator):
         controller_key = f"controller_{side}"
 
         controllers = ControllersSource(name="controllers")
+        self._controllers = controllers  # shared with the haptic sink (single tracker)
         # Static base_T_anchor rebase fed via external_inputs each step.
         xform = ValueInput(_BASE_T_ANCHOR_INPUT, TransformMatrix())
         transformed = controllers.transformed(xform.output("value"))
@@ -89,19 +107,56 @@ class XRController(IsaacTeleopTeleoperator):
 
         return OutputCombiner({"controller": ctrl})
 
+    def _build_sinks(self) -> list:
+        """Haptic sink for the active hand, fed per-step via ``external_inputs``.
+
+        Reuses the pipeline's ``ControllersSource`` tracker so the session creates a
+        single controller tracker (no OpenXR action-set contention). The pulse value
+        comes from an OPTIONAL ``ValueInput`` leaf that :meth:`send_feedback` writes
+        into — quiet frames feed an absent group (the sink skips them), so a timed
+        pulse from a previous frame keeps ringing instead of being stopped by an
+        explicit ``amplitude == 0`` refresh.
+        """
+        from isaacteleop.haptic_devices.controller import ControllerHapticDevice
+        from isaacteleop.retargeting_engine.deviceio_source_nodes import HapticSink
+        from isaacteleop.retargeting_engine.interface import OptionalType, ValueInput
+        from isaacteleop.retargeting_engine.tensor_types import ControllerHapticPulse
+
+        device = ControllerHapticDevice(self._controllers.get_tracker())  # type: ignore[union-attr]  # set in _build_pipeline
+        sink = HapticSink("haptic_sink", device)
+        pulse_input = ValueInput(_HAPTIC_INPUT, OptionalType(ControllerHapticPulse()))
+        return [sink.connect({self.config.hand_side: pulse_input.output("value")})]
+
     def _build_external_inputs(self) -> dict[str, Any]:
-        """Materialize the constant ``base_T_anchor`` external input (once, in connect)."""
-        from isaacteleop.retargeting_engine.interface import TensorGroup
-        from isaacteleop.retargeting_engine.tensor_types import TransformMatrix
+        """Materialize the constant ``base_T_anchor`` + mutable haptic-pulse inputs (once)."""
+        from isaacteleop.retargeting_engine.interface import OptionalTensorGroup, TensorGroup
+        from isaacteleop.retargeting_engine.tensor_types import ControllerHapticPulse, TransformMatrix
 
         tg = TensorGroup(TransformMatrix())
         tg[0] = np.asarray(self.config.base_T_anchor, dtype=np.float32)
-        return {_BASE_T_ANCHOR_INPUT: {"value": tg}}
+        self._haptic_group = OptionalTensorGroup(ControllerHapticPulse())  # starts absent
+        return {
+            _BASE_T_ANCHOR_INPUT: {"value": tg},
+            _HAPTIC_INPUT: {"value": self._haptic_group},
+        }
 
     def connect(self, calibrate: bool = True) -> None:
         super().connect(calibrate=calibrate)
         # Built after a successful connect so a failed connect leaves no half-state.
         self._external_inputs = self._build_external_inputs()
+
+    def update_base_T_anchor(self, base_T_anchor: np.ndarray) -> None:  # noqa: N802, N803  (frameA_T_frameB convention)
+        """Replace the static anchor->base rebase live (e.g. the post-preflight yaw alignment).
+
+        Updates the config (the single source of truth) and, when connected, rebuilds the
+        external-inputs TensorGroup so the next :meth:`get_action` step uses the new mapping.
+        """
+        m = np.asarray(base_T_anchor, dtype=np.float32)
+        if m.shape != (4, 4):
+            raise ValueError(f"base_T_anchor must be a 4x4 matrix, got shape {m.shape}")
+        self.config.base_T_anchor = m.tolist()
+        if self._external_inputs is not None:
+            self._external_inputs = self._build_external_inputs()
 
     # ------------------------------------------------------------------
     # Action features
@@ -136,7 +191,25 @@ class XRController(IsaacTeleopTeleoperator):
 
     @property
     def feedback_features(self) -> dict:
-        return {}
+        return {
+            # One frame of controller vibration; refresh every frame to sustain.
+            "amplitude": {"dtype": "float32", "shape": (), "names": None},  # [0, 1]
+            "frequency_hz": {"dtype": "float32", "shape": (), "names": None},  # 0 = default
+            "duration_s": {"dtype": "float32", "shape": (), "names": None},  # 0 = one frame
+        }
+
+    def send_feedback(self, feedback: dict[str, Any]) -> None:
+        """Queue a haptic pulse on the active controller, applied on the next step.
+
+        ``{"amplitude": [0..1], "frequency_hz": optional, "duration_s": optional}`` —
+        the runtime keeps vibrating for ``duration_s``; steady-state force feedback
+        (e.g. gripper effort) should just re-send every frame. ``amplitude == 0``
+        explicitly stops an active pulse.
+        """
+        self._haptic_pulse[0] = np.clip(float(feedback.get("amplitude", 0.0)), 0.0, 1.0)
+        self._haptic_pulse[1] = float(feedback.get("frequency_hz", 0.0))
+        self._haptic_pulse[2] = float(feedback.get("duration_s", 0.0))
+        self._haptic_pending = True
 
     @property
     def is_tracking(self) -> bool:
@@ -144,6 +217,15 @@ class XRController(IsaacTeleopTeleoperator):
         headset is connected over CloudXR and its controllers are live; the owning loop polls
         it to wait for the operator before commanding the arm."""
         return self._is_tracking
+
+    @property
+    def pose_valid(self) -> bool:
+        """Whether the runtime flagged the last grip pose as valid (``XR_SPACE_LOCATION_
+        POSITION_VALID``). A tracked-but-invalid pose is an IMU-extrapolated ghost — the
+        controller is out of the headset's camera view and its pose will snap back on
+        re-acquisition. The owning loop must treat such frames as untrusted (disengage
+        the clutch / hold the arm) instead of integrating them."""
+        return self._pose_valid
 
     # ------------------------------------------------------------------
     # Action extraction
@@ -160,6 +242,15 @@ class XRController(IsaacTeleopTeleoperator):
             ``{"grip_pos": (3,) [m], "grip_quat": (4,) [qx,qy,qz,qw], "squeeze": float,
             "trigger": float}`` — pose in the robot base frame; squeeze/trigger in ``[0, 1]``.
         """
+        # Flush the queued haptic pulse into the sink's optional input group: present only
+        # on frames where send_feedback() queued something (one send = one pulse), absent
+        # otherwise so a timed pulse keeps ringing. Copy: TensorGroup stores a reference.
+        if self._haptic_group is not None:
+            if self._haptic_pending:
+                self._haptic_group[0] = self._haptic_pulse.copy()
+                self._haptic_pending = False
+            else:
+                self._haptic_group.set_none()
         result = self._step(execution_events=self._running_events(), external_inputs=self._external_inputs)
 
         from isaacteleop.retargeting_engine.tensor_types.indices import ControllerInputIndex
@@ -172,6 +263,7 @@ class XRController(IsaacTeleopTeleoperator):
         squeeze = 0.0
         trigger = 0.0
         self._is_tracking = not getattr(controller, "is_none", False)
+        self._pose_valid = False
         if self._is_tracking:
             # A read failure on a partially-populated frame leaves the safe defaults above and
             # reports not-tracked, so the loop freezes the arm rather than trusting a partial frame.
@@ -180,8 +272,15 @@ class XRController(IsaacTeleopTeleoperator):
                 grip_quat = np.asarray(controller[ControllerInputIndex.GRIP_ORIENTATION], dtype=np.float32)
                 squeeze = float(controller[ControllerInputIndex.SQUEEZE_VALUE])
                 trigger = float(controller[ControllerInputIndex.TRIGGER_VALUE])
+                # The runtime's own verdict on the grip pose. False = IMU-extrapolated
+                # ghost (controller out of camera view); the pose values above are then
+                # smooth-looking but untrustworthy and will snap on re-acquisition.
+                # float() > 0.5 is robust whether the slot yields a Python bool or a
+                # 0-d tensor wrapper (which may not implement __bool__ meaningfully).
+                self._pose_valid = float(controller[ControllerInputIndex.GRIP_IS_VALID]) > 0.5
             except (IndexError, KeyError, TypeError, ValueError):
                 self._is_tracking = False
+                self._pose_valid = False
 
         return {
             "grip_pos": grip_pos,

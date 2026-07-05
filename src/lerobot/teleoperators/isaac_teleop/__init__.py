@@ -23,6 +23,7 @@ Each input device is an :class:`IsaacTeleopTeleoperator` subclass: :class:`XRCon
 from .base import IsaacTeleopTeleoperator
 from .clutch import Clutch
 from .config_isaac_teleop import IsaacTeleopConfig, SO101LeaderArmConfig, XRControllerConfig
+from .pose_gate import PoseGate
 from .teleop_so101_leader_arm import SO101LeaderArm, leader_joints_to_robot_action
 from .teleop_xr_controller import XRController
 from .xr_controller_processor import MapXRControllerActionToRobotAction
@@ -32,6 +33,7 @@ __all__ = [
     "IsaacTeleopConfig",
     "IsaacTeleopTeleoperator",
     "MapXRControllerActionToRobotAction",
+    "PoseGate",
     "SO101LeaderArm",
     "SO101LeaderArmConfig",
     "XRController",

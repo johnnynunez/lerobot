@@ -81,6 +81,14 @@ class IsaacTeleopTeleoperator(Teleoperator):
         """
         raise NotImplementedError
 
+    def _build_sinks(self) -> list:
+        """Build device-output sinks for ``TeleopSessionConfig.sinks`` (e.g. haptics).
+
+        Called once in :meth:`connect`, AFTER :meth:`_build_pipeline` so a sink can
+        reuse a tracker owned by the pipeline's source nodes. Default: no sinks.
+        """
+        return []
+
     # ------------------------------------------------------------------
     # Lifecycle (shared)
     # ------------------------------------------------------------------
@@ -116,7 +124,9 @@ class IsaacTeleopTeleoperator(Teleoperator):
             from isaacteleop.teleop_session_manager import TeleopSession, TeleopSessionConfig
 
             pipeline = self._build_pipeline()
-            session_config = TeleopSessionConfig(app_name=self.config.app_name, pipeline=pipeline)
+            session_config = TeleopSessionConfig(
+                app_name=self.config.app_name, pipeline=pipeline, sinks=self._build_sinks()
+            )
             self._session = TeleopSession(session_config)
             self._session.__enter__()
         except Exception:

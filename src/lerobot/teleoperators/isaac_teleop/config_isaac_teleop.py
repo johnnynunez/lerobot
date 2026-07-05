@@ -82,6 +82,13 @@ class XRControllerConfig(IsaacTeleopConfig):
     """Squeeze value above which the owning loop's clutch engages (held-to-enable). The
     device reports only the raw squeeze; the threshold is applied by the loop."""
 
+    auto_align_yaw: bool = True
+    """Rotate ``base_T_anchor`` about base Z after each passed preflight so the direction
+    the operator pushed during the move check (their real "robot forward") maps exactly to
+    robot +X. Compensates for the arbitrary yaw of the OpenXR anchor frame — it inherits
+    the headset's facing at session start / recenter, which otherwise rotates or mirrors
+    every hand motion relative to the robot."""
+
     base_T_anchor: list[list[float]] = field(  # noqa: N815  (frameA_T_frameB transform-matrix convention)
         default_factory=lambda: _DEFAULT_BASE_T_ANCHOR
     )

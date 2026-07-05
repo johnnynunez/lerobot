@@ -75,14 +75,24 @@ from lerobot.utils.feature_utils import build_dataset_frame, combine_feature_dic
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import init_logging
 
-from .common import (
-    ALIGN_DURATION_S,
-    RESET_DURATION_S,
-    Device,
-    build_device,
-    hold_action,
-    init_keyboard_listener,
-)
+try:
+    from .common import (
+        ALIGN_DURATION_S,
+        RESET_DURATION_S,
+        Device,
+        build_device,
+        hold_action,
+        init_keyboard_listener,
+    )
+except ImportError:  # run directly as a script (no parent package)
+    from common import (
+        ALIGN_DURATION_S,
+        RESET_DURATION_S,
+        Device,
+        build_device,
+        hold_action,
+        init_keyboard_listener,
+    )
 
 
 @dataclass
@@ -114,6 +124,12 @@ class RecordConfig:
     align: bool = True
     # [leader] Duration [s] of the startup alignment slew.
     align_duration: float = ALIGN_DURATION_S
+
+    # [xr] Guided pre-flight "calibration game" (--preflight=false to skip): proves the
+    # controller stream, tracking stability, motion scale, clutch, trigger, and the follower's
+    # servo bus before ANY motion — and again on every VR Play/resume edge, since the operator
+    # in the headset cannot see the calibration state of the chain.
+    preflight: bool = True
 
     # Resume recording on an existing (previously interrupted) dataset.
     resume: bool = False

@@ -71,6 +71,11 @@ class Clutch:
         self._origin_pos = np.asarray(grip_pos, dtype=float).copy()
         self._origin_rot = Rotation.from_quat(np.asarray(grip_quat, dtype=float))
 
+    @property
+    def last_commanded_pos(self) -> np.ndarray:
+        """The last commanded EE position [m] (held while disengaged) — telemetry hook."""
+        return self._last_commanded_pos.copy()
+
     def rebase(self, grip_pos: np.ndarray, grip_quat: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Return the absolute base-frame EE target ``(pos [m], quat [xyzw])`` for this frame."""
         pos = self._home_pos + (np.asarray(grip_pos, dtype=float) - self._origin_pos)
@@ -79,3 +84,32 @@ class Clutch:
         self._last_commanded_pos = pos.copy()
         self._last_commanded_rot = rot
         return pos, rot.as_quat()
+
+    def limit_lead(self, measured_pos: np.ndarray, max_lead_m: float) -> tuple[np.ndarray, float]:
+        """Anti-windup leash: keep the commanded target within ``max_lead_m`` of the arm.
+
+        The 1:1 clutch integrates controller deltas without knowing the arm's reachable
+        workspace: push past it and the commanded target keeps flying while the arm
+        saturates, after which the return motion is silently swallowed until the virtual
+        target re-enters the envelope — which reads as "the arm ignores me". Clamping the
+        lead — and dragging the engage home with it, so future deltas stay continuous —
+        makes the arm respond to the FIRST centimeter of the return motion. It also stops
+        the windup from surviving a re-clutch (engage latches home on the last COMMANDED
+        pose, which without the leash may sit far outside the workspace).
+
+        Call each engaged frame AFTER :meth:`rebase`, with the measured EE position (FK
+        of the measured joints, same base frame).
+
+        Returns:
+            ``(corrected_pos, excess_m)`` — the possibly pulled-back target and how far
+            it was pulled (``0.0`` when already within the leash).
+        """
+        measured = np.asarray(measured_pos, dtype=float)
+        lead = self._last_commanded_pos - measured
+        dist = float(np.linalg.norm(lead))
+        if dist <= max_lead_m:
+            return self._last_commanded_pos.copy(), 0.0
+        correction = lead * (1.0 - max_lead_m / dist)
+        self._home_pos = self._home_pos - correction
+        self._last_commanded_pos = self._last_commanded_pos - correction
+        return self._last_commanded_pos.copy(), dist - max_lead_m

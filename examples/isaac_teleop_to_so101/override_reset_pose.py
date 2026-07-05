@@ -35,7 +35,10 @@ from pathlib import Path
 
 from lerobot.robots.so_follower import SO100Follower, SO100FollowerConfig
 
-from .common import RESET_POSE_FILE
+try:
+    from .common import RESET_POSE_FILE
+except ImportError:  # run directly as a script (no parent package)
+    from common import RESET_POSE_FILE
 
 
 def parse_args():

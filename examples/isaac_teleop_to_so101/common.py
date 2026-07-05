@@ -60,6 +60,7 @@ from lerobot.teleoperators.isaac_teleop import (
     Clutch,
     IsaacTeleopConfig,
     MapXRControllerActionToRobotAction,
+    PoseGate,
     SO101LeaderArm,
     SO101LeaderArmConfig,
     XRController,
@@ -68,11 +69,31 @@ from lerobot.types import RobotAction, RobotObservation
 from lerobot.utils.constants import HF_LEROBOT_CALIBRATION, HF_LEROBOT_HOME, TELEOPERATORS
 from lerobot.utils.robot_utils import precise_sleep
 
+try:
+    from .preflight import (
+        PreflightConfig,
+        PreflightGame,
+        check_follower_gripper,
+        describe_calibration,
+        run_blocking,
+    )
+except ImportError:  # run directly as a script (no parent package)
+    from preflight import (
+        PreflightConfig,
+        PreflightGame,
+        check_follower_gripper,
+        describe_calibration,
+        run_blocking,
+    )
+
 # Fixed rate [Hz] for the teleoperate loop and the pre-loop slews / connect-wait poll sleeps.
 FPS = 30
 
 # CloudXR device-profile env file passed to the launcher (see default.env in this package).
-CLOUDXR_ENV_FILE = str(files(__package__) / "default.env")
+if __package__:
+    CLOUDXR_ENV_FILE = str(files(__package__) / "default.env")
+else:  # imported as a top-level module (scripts run directly from this directory)
+    CLOUDXR_ENV_FILE = str(Path(__file__).resolve().parent / "default.env")
 
 
 class LoopConfig(Protocol):
@@ -89,6 +110,7 @@ class LoopConfig(Protocol):
     reset_duration: float
     align: bool
     align_duration: float
+    preflight: bool
 
 
 # Per-device bundle consumed by the shared loop. ``compute`` returns None to mean
@@ -139,6 +161,70 @@ MAX_EE_STEP_M = 0.1
 # Soft-orientation IK weight: small but nonzero so the wrist follows the hand while position
 # dominates (the 5-DOF SO-101 cannot realize an arbitrary orientation). 0.0 = position-only.
 IK_ORIENTATION_WEIGHT = 0.01
+
+# Anti-windup leash [m]: max distance the commanded EE target may lead the MEASURED EE.
+# Without it, pushing past the arm's reachable workspace keeps integrating the virtual
+# target outward and the whole return motion is swallowed until it re-enters the envelope
+# (a huge direction-dependent dead zone that reads as "the arm ignores me").
+MAX_TARGET_LEAD_M = 0.06
+
+# Cadence [s] of the one-line teleop telemetry (controller pose/heading, target vs arm).
+STATUS_PERIOD_S = 1.0
+
+# Haptic grammar (amplitude, frequency_hz, duration_s): distinct pulses the operator can
+# tell apart without reading anything — the terminal is invisible from inside the headset.
+HAPTIC_CHECK_PASSED = {"amplitude": 0.5, "duration_s": 0.08}
+HAPTIC_CHECK_FAILED = {"amplitude": 1.0, "duration_s": 0.4}
+HAPTIC_ALL_PASSED = {"amplitude": 0.8, "duration_s": 0.15}
+# Workspace-edge buzz: low steady rumble re-sent every frame while the leash is taut.
+HAPTIC_EDGE_BUZZ = {"amplitude": 0.25, "duration_s": 0.05}
+# Clutch engage/disengage clicks: strong = the arm is now LISTENING, soft = released.
+HAPTIC_ENGAGE = {"amplitude": 0.9, "duration_s": 0.08}
+HAPTIC_DISENGAGE = {"amplitude": 0.4, "duration_s": 0.05}
+# Pose-gate forced disengage: the controller left the headset's tracking view (or its
+# pose teleported) while squeezing — long firm pulse, clearly not the soft release click.
+HAPTIC_POSE_LOST = {"amplitude": 0.7, "duration_s": 0.25}
+
+
+def _heading_deg(quat_xyzw: np.ndarray) -> tuple[float, float]:
+    """Controller pointing direction as (yaw, pitch) [deg] in the robot base frame.
+
+    Uses the grip frame's -Z axis (the direction the controller body points, OpenXR grip
+    convention). Yaw: 0 = robot +X (forward), +90 = robot +Y (left). Pitch: + = up.
+    """
+    from lerobot.utils.rotation import Rotation
+
+    fwd = Rotation.from_quat(np.asarray(quat_xyzw, dtype=float)).as_matrix() @ np.array([0.0, 0.0, -1.0])
+    yaw = float(np.degrees(np.arctan2(fwd[1], fwd[0])))
+    pitch = float(np.degrees(np.arctan2(fwd[2], float(np.hypot(fwd[0], fwd[1])))))
+    return yaw, pitch
+
+
+def _yaw_aligned_base_T_anchor(  # noqa: N802  (frameA_T_frameB transform-matrix convention)
+    base_T_anchor: np.ndarray,  # noqa: N803
+    move_excursion: np.ndarray,
+) -> np.ndarray | None:
+    """Rotate ``base_T_anchor`` about base Z so the preflight move direction maps to +X.
+
+    The OpenXR anchor frame inherits the headset's facing at session start / recenter, so
+    the static default mapping is off by an arbitrary yaw — hand motion comes out rotated
+    (or feels mirrored) relative to the robot. The preflight move check asks the operator
+    to push toward the ROBOT's front; the horizontal direction of that excursion IS their
+    physical robot-forward, measured in the CURRENT base frame, so left-composing the yaw
+    that turns it onto +X fixes the mapping incrementally (already aligned -> ~0 change).
+
+    Returns the corrected matrix, or None when the excursion was too vertical to define
+    a yaw (the operator pushed up/down — nothing to align with).
+    """
+    exc = np.asarray(move_excursion, dtype=float)
+    horiz = float(np.hypot(exc[0], exc[1]))
+    total = float(np.linalg.norm(exc))
+    if total <= 0.0 or horiz < 0.5 * total:  # >60 deg off horizontal: direction unusable
+        return None
+    yaw_err = float(np.arctan2(exc[1], exc[0]))  # angle from robot +X, current base frame
+    c, s = float(np.cos(-yaw_err)), float(np.sin(-yaw_err))
+    rz = np.array([[c, -s, 0.0, 0.0], [s, c, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]])
+    return rz @ np.asarray(base_T_anchor, dtype=float)
 
 
 def _ensure_so101_urdf() -> str:
@@ -271,6 +357,12 @@ def _wait_for_xr_controller(teleop_device: XRController) -> None:
         time.sleep(1.0 / FPS)
 
 
+# A VR-client pause/stop drops tracking; a recovery after this long is a "Play" edge that
+# re-arms the preflight game (shorter blips are ordinary tracking flicker, absorbed by the
+# hold-last convention).
+XR_PLAY_EDGE_GAP_S = 2.0
+
+
 def setup_xr(cfg: LoopConfig, robot, motor_names: list[str]) -> Device:
     """Build the XR controller device bundle (clutch + soft-orientation IK pipeline)."""
     kinematics_solver = RobotKinematics(
@@ -313,6 +405,66 @@ def setup_xr(cfg: LoopConfig, robot, motor_names: list[str]) -> Device:
     clutch: Clutch | None = None
     prev_enabled = False
 
+    # Pose gate: per-frame trust verdict on the raw controller pose. When the controller
+    # leaves the headset's camera view the runtime keeps streaming an IMU-extrapolated
+    # ghost pose that drifts smoothly and then TELEPORTS back on re-acquisition; if the
+    # clutch stayed engaged through that, the snap would be integrated as one giant delta
+    # (the arm "goes crazy" right when the operator looks back at their hands). Any
+    # non-ok frame force-releases the clutch below; re-engaging latches a fresh origin,
+    # so recovery is jump-free by construction.
+    pose_gate = PoseGate()
+
+    # Haptic mirror of the preflight events: pass/fail/done pulses the operator FEELS —
+    # the terminal is invisible from inside the headset. Queued via send_feedback and
+    # applied on the device's next get_action() step.
+    def _haptic_notify(event: str) -> None:
+        pulse = {
+            "check_passed": HAPTIC_CHECK_PASSED,
+            "check_failed": HAPTIC_CHECK_FAILED,
+            "all_passed": HAPTIC_ALL_PASSED,
+        }.get(event)
+        if pulse is not None:
+            teleop_device.send_feedback(pulse)
+
+    # Preflight game: proves the whole chain (stream, jitter, scale, clutch, trigger,
+    # follower bus) before ANY teleop command. Re-armed on every VR "Play" edge.
+    game = PreflightGame(
+        PreflightConfig(clutch_threshold=teleop_config.clutch_threshold, fps=FPS),
+        notify=_haptic_notify,
+    )
+    tracking_lost_since: float | None = None
+    last_status_t = 0.0
+
+    def _apply_yaw_alignment() -> None:
+        """Yaw-align base_T_anchor with the preflight move direction (operator's forward).
+
+        The move check pushes toward the ROBOT's front; rotating the anchor mapping so that
+        push maps to base +X makes "hand forward" mean "robot forward" regardless of where
+        the headset was facing at session start — the main source of "the arm goes the
+        wrong way". Runs after every passed preflight, so each Play re-aligns too.
+        """
+        if not getattr(teleop_config, "auto_align_yaw", True) or game.move_excursion is None:
+            return
+        aligned = _yaw_aligned_base_T_anchor(np.asarray(teleop_config.base_T_anchor), game.move_excursion)
+        if aligned is None:
+            print("[preflight] yaw auto-align skipped — the move was too vertical to define a heading.")
+            return
+        yaw_err = float(np.degrees(np.arctan2(game.move_excursion[1], game.move_excursion[0])))
+        teleop_device.update_base_T_anchor(aligned)
+        print(
+            f"[preflight] yaw auto-aligned: your push direction was {yaw_err:+.0f} deg off robot "
+            "forward; hand motion is now mapped so that push = robot +X."
+        )
+
+    def _run_follower_check() -> None:
+        """Follower-side leg of the preflight: gripper wiggle + calibration scorecard."""
+        print(f"[preflight] {describe_calibration(robot)}")
+        print("[preflight] wiggling the gripper to verify the follower executes commands…")
+        ok, detail = check_follower_gripper(robot, motor_names, FPS)
+        if not ok:
+            raise SystemExit(f"PREFLIGHT FAILED — {detail}. Fix the follower before teleoperating.")
+        print(f"[preflight] ✓ follower: {detail}")
+
     def startup() -> None:
         nonlocal clutch
         # Connect and wait for the operator to don the headset BEFORE moving the arm, so the
@@ -321,6 +473,15 @@ def setup_xr(cfg: LoopConfig, robot, motor_names: list[str]) -> Device:
         if not teleop_device.is_connected:
             raise ValueError("Teleop is not connected!")
         _wait_for_xr_controller(teleop_device)
+
+        if cfg.preflight:
+            # Controller-side checks first (arm untouched), then the follower check
+            # (gripper-only wiggle), all BEFORE the reset slew — the slew is the first
+            # large motion, so everything must already be proven when it runs.
+            game.arm("startup — verify the headset, controller, and follower before any motion")
+            run_blocking(game, teleop_device, FPS)
+            _apply_yaw_alignment()
+            _run_follower_check()
 
         if cfg.reset_to_origin:
             reset_pose_file = Path(RESET_POSE_FILE.format(robot_name=robot.name, robot_id=robot.id))
@@ -341,21 +502,100 @@ def setup_xr(cfg: LoopConfig, robot, motor_names: list[str]) -> Device:
         print("Starting teleop loop. Squeeze and move the controller to teleoperate the robot...")
 
     def compute(robot_obs: RobotObservation | None) -> RobotAction | None:
-        nonlocal prev_enabled
+        nonlocal prev_enabled, tracking_lost_since, last_status_t
         assert clutch is not None  # set in startup(), which runs before compute()
         xr_action = teleop_device.get_action()
+        tracking = teleop_device.is_tracking
+
+        if cfg.preflight:
+            # "Play" edge: the VR client pausing/stopping drops tracking; when the stream
+            # comes back after a real gap the operator may have re-donned the headset,
+            # swapped controllers, or drifted the guardian — nothing about the chain is
+            # trusted anymore. Re-arm the game; the loop holds the arm until it passes.
+            if not tracking:
+                if tracking_lost_since is None:
+                    tracking_lost_since = time.monotonic()
+            else:
+                if (
+                    tracking_lost_since is not None
+                    and time.monotonic() - tracking_lost_since >= XR_PLAY_EDGE_GAP_S
+                    and not game.active
+                ):
+                    game.arm("VR stream resumed (Play) — re-verify before moving the arm")
+                    prev_enabled = False
+                tracking_lost_since = None
+            if game.active:
+                if game.step(xr_action, tracking and teleop_device.pose_valid):
+                    _apply_yaw_alignment()  # re-align on every passed preflight (each Play)
+                return None  # hold the measured pose while the game runs
+
         grip_pos = np.asarray(xr_action["grip_pos"], dtype=float)
         grip_quat = np.asarray(xr_action["grip_quat"], dtype=float)
         squeeze = float(xr_action["squeeze"])
         trigger = float(xr_action["trigger"])
         enabled = squeeze > teleop_config.clutch_threshold
 
+        # POSE GATE: act only on frames whose pose the runtime flags valid AND that did
+        # not teleport since the previous frame. Everything else (controller out of the
+        # headset's view, snap-back on re-acquisition, settle window right after) force-
+        # releases the clutch and holds the arm. The operator feels a firm pulse on the
+        # forced release, then a 1 Hz reminder pulse while they keep squeezing a pose
+        # that is not being honored (otherwise a ghost-squeeze would be silently ignored).
+        verdict = pose_gate.check(grip_pos, tracking and teleop_device.pose_valid)
+        if verdict != "ok":
+            now = time.monotonic()
+            periodic = tracking and now - last_status_t >= STATUS_PERIOD_S
+            if prev_enabled:
+                teleop_device.send_feedback(HAPTIC_POSE_LOST)
+                print(
+                    f"[teleop] controller pose {verdict} — clutch force-released, arm held. "
+                    "Bring the controller back into the headset's view and squeeze again.",
+                    flush=True,
+                )
+            elif enabled and periodic:
+                teleop_device.send_feedback(HAPTIC_POSE_LOST)
+            prev_enabled = False
+            if periodic:
+                last_status_t = now
+                print(f"[teleop] pose {verdict} (controller out of the headset's view?) | arm held")
+            return None
+
         # On the engage edge, latch the clutch home (current arm EE) and the controller
-        # origin so the per-frame delta starts at zero (no jump).
+        # origin so the per-frame delta starts at zero (no jump). Haptic click on both
+        # edges so the operator FEELS when the arm starts/stops listening — the most
+        # common "the arm ignores me" cause is a squeeze that never crossed the threshold.
         is_engage_frame = enabled and not prev_enabled
         if is_engage_frame:
             clutch.engage(grip_pos, grip_quat)
+            teleop_device.send_feedback(HAPTIC_ENGAGE)
+        elif prev_enabled and not enabled:
+            teleop_device.send_feedback(HAPTIC_DISENGAGE)
         prev_enabled = enabled
+
+        # Measured EE (FK of measured joints): telemetry + the anti-windup leash below.
+        measured_pos = None
+        if robot_obs is not None:
+            q_measured = np.array([float(robot_obs[f"{n}.pos"]) for n in motor_names], dtype=float)
+            measured_pos = kinematics_solver.forward_kinematics(q_measured)[:3, 3]
+
+        # One-line telemetry at STATUS_PERIOD_S: where the controller is/points, whether
+        # the clutch is engaged, and how far the commanded target leads the arm. This is
+        # the "why is it not doing what I want" panel — a spectator can read it aloud.
+        now = time.monotonic()
+        if tracking and now - last_status_t >= STATUS_PERIOD_S:
+            last_status_t = now
+            yaw, pitch = _heading_deg(grip_quat)
+            state = (
+                "ENGAGED" if enabled else f"idle (squeeze {squeeze:.2f} < {teleop_config.clutch_threshold})"
+            )
+            line = (
+                f"[teleop] ctrl xyz=({grip_pos[0]:+.2f},{grip_pos[1]:+.2f},{grip_pos[2]:+.2f})m "
+                f"yaw={yaw:+4.0f} pitch={pitch:+4.0f} deg | {state} | trig {trigger:.2f}"
+            )
+            if enabled and measured_pos is not None:
+                lead = float(np.linalg.norm(clutch.last_commanded_pos - measured_pos))
+                line += f" | target leads arm {lead * 100:.1f} cm"
+            print(line, flush=True)
 
         # SAFETY GATE: command the robot ONLY while the clutch is engaged; otherwise return
         # None so the loop holds the measured joints (releasing the clutch freezes the arm).
@@ -364,13 +604,53 @@ def setup_xr(cfg: LoopConfig, robot, motor_names: list[str]) -> Device:
 
         # Rebase the raw grip pose onto the EE, then run the pipeline. closedness = trigger.
         ee_pos, ee_quat = clutch.rebase(grip_pos, grip_quat)
+
+        # Anti-windup leash: never let the virtual target lead the measured EE by more than
+        # MAX_TARGET_LEAD_M. Pushing past the workspace edge otherwise keeps integrating an
+        # unreachable target, and the return motion is swallowed until it re-enters — the
+        # single biggest "the arm ignores me" source. The edge buzz tells the operator they
+        # are pushing against the boundary (arm cannot follow), not against a dead mapping.
+        if measured_pos is not None:
+            ee_pos, excess = clutch.limit_lead(measured_pos, MAX_TARGET_LEAD_M)
+            if excess > 0.005:
+                teleop_device.send_feedback(HAPTIC_EDGE_BUZZ)
+
         ee_action = {
             "ee_pose": np.concatenate([ee_pos, ee_quat]).astype(np.float32),
             "closedness": trigger,
         }
-        return xr_to_robot_joints_processor((ee_action, robot_obs))
+        robot_action = xr_to_robot_joints_processor((ee_action, robot_obs))
+        # Gripper force feedback: servo stall (commanded vs measured jaw gap) means the
+        # jaw is squeezing something — rumble the controller proportionally.
+        if robot_obs is not None and robot_action is not None:
+            _send_grip_haptic(teleop_device, robot_action, robot_obs)
+        return robot_action
 
     return Device(compute=compute, startup=startup, cleanup=teleop_device.disconnect)
+
+
+# Gripper stall [RANGE_0_100 units] where rumble starts (below = free-motion tracking lag)
+# and where it saturates to full amplitude.
+GRIP_HAPTIC_DEADBAND = 8.0
+GRIP_HAPTIC_SATURATION = 35.0
+
+
+def _send_grip_haptic(teleop_device, robot_action: RobotAction, robot_obs: RobotObservation) -> None:
+    """Map gripper servo stall to controller rumble (grip-force proxy).
+
+    A position servo that cannot reach its commanded jaw target is exerting force on
+    whatever blocks it; |commanded - measured| is a calibration-free effort estimate.
+    Amplitude ramps from the free-motion deadband up to saturation, so light contact
+    is a faint buzz and a hard squeeze is full rumble.
+    """
+    cmd, meas = robot_action.get("gripper.pos"), robot_obs.get("gripper.pos")
+    if cmd is None or meas is None:
+        return
+    stall = abs(float(cmd) - float(meas)) - GRIP_HAPTIC_DEADBAND
+    if stall <= 0.0:
+        return
+    amplitude = min(1.0, stall / (GRIP_HAPTIC_SATURATION - GRIP_HAPTIC_DEADBAND))
+    teleop_device.send_feedback({"amplitude": amplitude})
 
 
 # ============================================================================
