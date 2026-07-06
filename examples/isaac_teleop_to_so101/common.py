@@ -652,6 +652,10 @@ def setup_xr(cfg: LoopConfig, robot, motor_names: list[str]) -> Device:
                 "engaged": enabled,
                 "squeeze": round(squeeze, 1),
                 "trigger": round(trigger, 1),
+                # Where the controller points in the robot base frame (compass on the HUD).
+                # Quantized to 5 deg so HudClient's dedupe keeps hand-tremor frames free.
+                "yaw_deg": round(yaw / 5.0) * 5.0,
+                "pitch_deg": round(pitch / 5.0) * 5.0,
             }
             if enabled and measured_pos is not None:
                 lead = float(np.linalg.norm(clutch.last_commanded_pos - measured_pos))

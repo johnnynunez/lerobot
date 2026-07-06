@@ -99,6 +99,42 @@ def test_render_long_instruction_wraps_inside_panel():
     assert rgba.shape == (hud.PANEL_H, hud.PANEL_W, 4)
 
 
+def _compass_ring_zone(rgba: np.ndarray) -> np.ndarray:
+    """Bottom arc of the compass dial — empty background in the compass-less layout."""
+    return rgba[250:280, 640:700, :3].astype(int).sum(axis=2)
+
+
+def test_render_teleop_compass_only_with_heading():
+    """The pointing compass renders iff yaw_deg is present and finite (degrades cleanly)."""
+    with_yaw = hud.render_hud({"phase": "teleop", "engaged": True, "yaw_deg": 45.0, "pitch_deg": 15.0})
+    without_yaw = hud.render_hud({"phase": "teleop", "engaged": True})
+    junk_yaw = hud.render_hud({"phase": "teleop", "yaw_deg": "n/a", "pitch_deg": float("nan")})
+    assert _compass_ring_zone(with_yaw).max() > 250  # ring drawn
+    assert _compass_ring_zone(without_yaw).max() < 250  # plain background
+    assert _compass_ring_zone(junk_yaw).max() < 250  # malformed -> degraded, no crash
+
+
+def test_render_teleop_compass_needle_follows_yaw():
+    """Needle direction: yaw=0 -> robot +X -> screen up; yaw=+90 -> robot +Y -> screen left."""
+
+    def needle_centroid(yaw: float) -> tuple[float, float]:
+        rgba = hud.render_hud({"phase": "teleop", "engaged": True, "yaw_deg": yaw, "pitch_deg": 0.0})
+        r = rgba[:, :, 0].astype(int)
+        g = rgba[:, :, 1].astype(int)
+        b = rgba[:, :, 2].astype(int)
+        mask = (g > 150) & (g > r + 40) & (g > b + 40)  # the ok-green needle
+        mask[:120, :] = False  # exclude the title/status rows
+        mask[:, :580] = False  # restrict to the compass area
+        ys, xs = np.where(mask)
+        assert len(ys) > 0, "no needle pixels found"
+        return float(ys.mean() - 210), float(xs.mean() - 668)  # (dy, dx) from dial center
+
+    dy_fwd, dx_fwd = needle_centroid(0.0)
+    dy_left, dx_left = needle_centroid(90.0)
+    assert dy_fwd < -5 and abs(dx_fwd) < 8  # points up
+    assert dx_left < -5 and abs(dy_left) < 8  # points left
+
+
 # ---------------------------------------------------------------------------- LazyFollow
 
 _IDENTITY_Q = (1.0, 0.0, 0.0, 0.0)

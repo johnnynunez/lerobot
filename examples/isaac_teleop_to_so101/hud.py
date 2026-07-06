@@ -150,6 +150,42 @@ def _as_float(value) -> float | None:
     return f if math.isfinite(f) else None
 
 
+def _draw_heading_compass(draw, fonts, *, yaw_deg, pitch_deg, engaged: bool, accent) -> None:
+    """Top-down compass showing where the controller points in the ROBOT base frame.
+
+    Yaw convention matches ``common._heading_deg``: 0 deg = robot +X (forward) = compass
+    UP; +90 deg = robot +Y (left) = compass LEFT (top-down view of a Z-up base frame, so
+    positive yaw sweeps counter-clockwise on screen). The pitch readout is numeric
+    (+ = up). Skipped entirely when yaw is missing/non-finite so older senders and
+    malformed frames degrade to the previous layout.
+    """
+    if yaw_deg is None:
+        return
+    cx, cy, r = 668, 210, 62
+    ring = (90, 90, 90, 255)
+    needle = _SEVERITY_COLORS["ok"][1] if engaged else (170, 170, 170, 255)
+    draw.ellipse([cx - r, cy - r, cx + r, cy + r], outline=ring, width=2)
+    # Cardinal marks: robot +X (front) up, +Y (left) on the left of the dial.
+    draw.text((cx - 6, cy - r - 24), "+X", font=fonts["small"], fill=(150, 150, 150, 255))
+    draw.text((cx - r - 30, cy - 9), "+Y", font=fonts["small"], fill=(120, 120, 120, 255))
+    # Needle: screen x = -sin(yaw) (positive yaw -> left), screen y = -cos(yaw) (0 -> up).
+    a = math.radians(yaw_deg)
+    tip = (cx - (r - 8) * math.sin(a), cy - (r - 8) * math.cos(a))
+    tail = (cx + 14 * math.sin(a), cy + 14 * math.cos(a))
+    draw.line([tail, tip], fill=needle, width=5)
+    draw.ellipse([tip[0] - 5, tip[1] - 5, tip[0] + 5, tip[1] + 5], fill=needle)
+    draw.ellipse([cx - 4, cy - 4, cx + 4, cy + 4], fill=ring)
+    label = f"yaw {yaw_deg:+.0f}"
+    if pitch_deg is not None:
+        label += f"  pitch {pitch_deg:+.0f}"
+    draw.text(
+        (cx - draw.textlength(label, font=fonts["small"]) / 2, cy + r + 8),
+        label,
+        font=fonts["small"],
+        fill=(190, 190, 190, 255),
+    )
+
+
 def render_hud(state: dict, fonts=None) -> np.ndarray:
     """Render one HUD frame from a state dict -> (PANEL_H, PANEL_W, 4) uint8 RGBA.
 
@@ -192,6 +228,14 @@ def render_hud(state: dict, fonts=None) -> np.ndarray:
         stateline = "ENGAGED" if engaged else "idle — squeeze the grip to engage"
         color = _SEVERITY_COLORS["ok"][1] if engaged else (170, 170, 170)
         draw.text((36, 116), stateline, font=fonts["body"], fill=color)
+        _draw_heading_compass(
+            draw,
+            fonts,
+            yaw_deg=_as_float(state.get("yaw_deg")),
+            pitch_deg=_as_float(state.get("pitch_deg")),
+            engaged=engaged,
+            accent=accent,
+        )
         y = 180
         for label, value in (("squeeze", state.get("squeeze")), ("trigger", state.get("trigger"))):
             frac = _as_float(value)
