@@ -135,6 +135,20 @@ def test_render_teleop_compass_needle_follows_yaw():
     assert dx_left < -5 and abs(dy_left) < 8  # points left
 
 
+def test_render_teleop_speed_chip():
+    """The motion-scale chip renders when speed_scale is present and differs by value."""
+    zone = (slice(150, 195), slice(20, 320))  # chip area (left column, under the state line)
+    without = hud.render_hud({"phase": "teleop", "engaged": True})
+    at_1x = hud.render_hud({"phase": "teleop", "engaged": True, "speed_scale": 1.0})
+    at_quarter = hud.render_hud({"phase": "teleop", "engaged": True, "speed_scale": 0.25})
+    # Present vs absent and 1.0 vs 0.25 must both change pixels in the chip zone.
+    assert np.count_nonzero(without[zone] != at_1x[zone]) > 100
+    assert np.count_nonzero(at_1x[zone] != at_quarter[zone]) > 100
+    # Junk value degrades to no chip, never raises.
+    junk = hud.render_hud({"phase": "teleop", "speed_scale": "fast"})
+    assert junk.shape == (hud.PANEL_H, hud.PANEL_W, 4)
+
+
 # ---------------------------------------------------------------------------- LazyFollow
 
 _IDENTITY_Q = (1.0, 0.0, 0.0, 0.0)

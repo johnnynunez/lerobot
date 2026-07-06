@@ -240,7 +240,12 @@ class XRController(IsaacTeleopTeleoperator):
 
         Returns:
             ``{"grip_pos": (3,) [m], "grip_quat": (4,) [qx,qy,qz,qw], "squeeze": float,
-            "trigger": float}`` — pose in the robot base frame; squeeze/trigger in ``[0, 1]``.
+            "trigger": float, "thumbstick_x": float, "thumbstick_y": float,
+            "thumbstick_click": bool, "primary_click": bool}`` — pose in the robot base
+            frame; squeeze/trigger in ``[0, 1]``; thumbstick axes in ``[-1, 1]``
+            (x right, y up). The extra inputs let the owning loop offer in-headset
+            runtime controls (speed scaling, re-align, etc.) without reaching for the
+            keyboard the operator cannot see.
         """
         # Flush the queued haptic pulse into the sink's optional input group: present only
         # on frames where send_feedback() queued something (one send = one pulse), absent
@@ -262,6 +267,10 @@ class XRController(IsaacTeleopTeleoperator):
         grip_quat = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
         squeeze = 0.0
         trigger = 0.0
+        thumb_x = 0.0
+        thumb_y = 0.0
+        thumb_click = False
+        primary_click = False
         self._is_tracking = not getattr(controller, "is_none", False)
         self._pose_valid = False
         if self._is_tracking:
@@ -272,6 +281,10 @@ class XRController(IsaacTeleopTeleoperator):
                 grip_quat = np.asarray(controller[ControllerInputIndex.GRIP_ORIENTATION], dtype=np.float32)
                 squeeze = float(controller[ControllerInputIndex.SQUEEZE_VALUE])
                 trigger = float(controller[ControllerInputIndex.TRIGGER_VALUE])
+                thumb_x = float(controller[ControllerInputIndex.THUMBSTICK_X])
+                thumb_y = float(controller[ControllerInputIndex.THUMBSTICK_Y])
+                thumb_click = float(controller[ControllerInputIndex.THUMBSTICK_CLICK]) > 0.5
+                primary_click = float(controller[ControllerInputIndex.PRIMARY_CLICK]) > 0.5
                 # The runtime's own verdict on the grip pose. False = IMU-extrapolated
                 # ghost (controller out of camera view); the pose values above are then
                 # smooth-looking but untrustworthy and will snap on re-acquisition.
@@ -287,4 +300,8 @@ class XRController(IsaacTeleopTeleoperator):
             "grip_quat": grip_quat,
             "squeeze": squeeze,
             "trigger": trigger,
+            "thumbstick_x": thumb_x,
+            "thumbstick_y": thumb_y,
+            "thumbstick_click": thumb_click,
+            "primary_click": primary_click,
         }

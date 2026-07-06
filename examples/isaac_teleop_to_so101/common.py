@@ -171,6 +171,18 @@ IK_ORIENTATION_WEIGHT = 0.01
 # (a huge direction-dependent dead zone that reads as "the arm ignores me").
 MAX_TARGET_LEAD_M = 0.06
 
+# Runtime motion-scale steps selectable from the thumbstick (flick up = next, down =
+# previous). 1.0 = the classic 1:1 mirror; < 1 = precision mode (hand moves N cm, arm
+# moves N*scale cm); > 1 = coarse mode. The loop RATE stays fixed at FPS — scaling the
+# mapping is the safe way to go "slower/faster"; changing Hz mid-session would silently
+# re-tune every rate limiter and jitter filter in the chain.
+SPEED_STEPS = (0.25, 0.5, 0.75, 1.0, 1.5, 2.0)
+SPEED_DEFAULT_IDX = 3  # 1.0
+# Thumbstick hysteresis: a step fires when |y| crosses THUMB_STEP_AT and re-arms only
+# after it returns below THUMB_REARM_BELOW (one step per flick, no auto-repeat).
+THUMB_STEP_AT = 0.7
+THUMB_REARM_BELOW = 0.3
+
 # Cadence [s] of the one-line teleop telemetry (controller pose/heading, target vs arm).
 STATUS_PERIOD_S = 1.0
 
@@ -447,6 +459,9 @@ def setup_xr(cfg: LoopConfig, robot, motor_names: list[str]) -> Device:
     )
     tracking_lost_since: float | None = None
     last_status_t = 0.0
+    # Runtime motion-scale selector state (thumbstick flick up/down; see SPEED_STEPS).
+    speed_idx = SPEED_DEFAULT_IDX
+    thumb_armed = True
 
     def _apply_yaw_alignment() -> None:
         """Yaw-align base_T_anchor with the preflight move direction (operator's forward).
@@ -541,7 +556,7 @@ def setup_xr(cfg: LoopConfig, robot, motor_names: list[str]) -> Device:
         print("Starting teleop loop. Squeeze and move the controller to teleoperate the robot...")
 
     def compute(robot_obs: RobotObservation | None) -> RobotAction | None:
-        nonlocal prev_enabled, tracking_lost_since, last_status_t
+        nonlocal prev_enabled, tracking_lost_since, last_status_t, speed_idx, thumb_armed
         assert clutch is not None  # set in startup(), which runs before compute()
         xr_action = teleop_device.get_action()
         tracking = teleop_device.is_tracking
@@ -579,6 +594,23 @@ def setup_xr(cfg: LoopConfig, robot, motor_names: list[str]) -> Device:
         squeeze = float(xr_action["squeeze"])
         trigger = float(xr_action["trigger"])
         enabled = squeeze > teleop_config.clutch_threshold
+
+        # Motion-scale selector: thumbstick flick up/down steps through SPEED_STEPS with
+        # hysteresis (one step per flick). Works engaged or idle — scale changes recompute
+        # the delta from the latched origin, so mid-engage changes stay smooth. Haptic
+        # click + HUD update are the operator's confirmation (terminal is just a mirror).
+        thumb_y = float(xr_action.get("thumbstick_y", 0.0))
+        if thumb_armed and abs(thumb_y) >= THUMB_STEP_AT:
+            step = 1 if thumb_y > 0 else -1
+            new_idx = min(len(SPEED_STEPS) - 1, max(0, speed_idx + step))
+            thumb_armed = False
+            if new_idx != speed_idx:
+                speed_idx = new_idx
+                teleop_device.send_feedback(HAPTIC_ENGAGE if step > 0 else HAPTIC_DISENGAGE)
+                print(f"[teleop] motion scale -> x{SPEED_STEPS[speed_idx]:.2f}", flush=True)
+                last_status_t = 0.0  # force the next HUD/telemetry snapshot immediately
+        elif not thumb_armed and abs(thumb_y) <= THUMB_REARM_BELOW:
+            thumb_armed = True
 
         # POSE GATE: act only on frames whose pose the runtime flags valid AND that did
         # not teleport since the previous frame. Everything else (controller out of the
@@ -652,6 +684,7 @@ def setup_xr(cfg: LoopConfig, robot, motor_names: list[str]) -> Device:
                 "engaged": enabled,
                 "squeeze": round(squeeze, 1),
                 "trigger": round(trigger, 1),
+                "speed_scale": SPEED_STEPS[speed_idx],
                 # Where the controller points in the robot base frame (compass on the HUD).
                 # Quantized to 5 deg so HudClient's dedupe keeps hand-tremor frames free.
                 "yaw_deg": round(yaw / 5.0) * 5.0,
@@ -670,7 +703,7 @@ def setup_xr(cfg: LoopConfig, robot, motor_names: list[str]) -> Device:
             return None
 
         # Rebase the raw grip pose onto the EE, then run the pipeline. closedness = trigger.
-        ee_pos, ee_quat = clutch.rebase(grip_pos, grip_quat)
+        ee_pos, ee_quat = clutch.rebase(grip_pos, grip_quat, motion_scale=SPEED_STEPS[speed_idx])
 
         # Anti-windup leash: never let the virtual target lead the measured EE by more than
         # MAX_TARGET_LEAD_M. Pushing past the workspace edge otherwise keeps integrating an

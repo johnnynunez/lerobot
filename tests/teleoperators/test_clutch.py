@@ -84,6 +84,28 @@ def test_position_delta_is_one_to_one():
     assert np.allclose(pos, [1.3, 0.8, 1.0])
 
 
+def test_motion_scale_scales_position_delta_only():
+    # motion_scale multiplies the position delta from the engage origin; orientation
+    # stays 1:1. Scale changes mid-engage recompute from the origin (no accumulation).
+    clutch = Clutch(_pose_matrix([1.0, 1.0, 1.0]))
+    clutch.engage(np.zeros(3), _IDENTITY_QUAT)
+    grip = np.array([0.4, 0.0, -0.2])
+    grip_quat = Rotation.from_rotvec([0.0, 0.0, np.pi / 4]).as_quat()
+
+    pos_half, quat_half = clutch.rebase(grip, grip_quat, motion_scale=0.5)
+    assert np.allclose(pos_half, [1.2, 1.0, 0.9])  # half the delta
+    pos_double, quat_double = clutch.rebase(grip, grip_quat, motion_scale=2.0)
+    assert np.allclose(pos_double, [1.8, 1.0, 0.6])  # double the delta, from the same origin
+    # Orientation identical under both scales (never scaled).
+    assert np.allclose(quat_half, quat_double)
+
+    # Invalid scales fall back to 1:1 instead of corrupting the target.
+    pos_junk, _ = clutch.rebase(grip, grip_quat, motion_scale=float("nan"))
+    pos_zero, _ = clutch.rebase(grip, grip_quat, motion_scale=0.0)
+    assert np.allclose(pos_junk, [1.4, 1.0, 0.8])
+    assert np.allclose(pos_zero, [1.4, 1.0, 0.8])
+
+
 def test_position_is_relative_to_origin_not_absolute():
     # The delta is measured from the engage origin, so a nonzero origin does not
     # leak into the output — only the change from it does.

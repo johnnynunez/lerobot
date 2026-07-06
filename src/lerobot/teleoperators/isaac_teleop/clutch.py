@@ -76,9 +76,22 @@ class Clutch:
         """The last commanded EE position [m] (held while disengaged) — telemetry hook."""
         return self._last_commanded_pos.copy()
 
-    def rebase(self, grip_pos: np.ndarray, grip_quat: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """Return the absolute base-frame EE target ``(pos [m], quat [xyzw])`` for this frame."""
-        pos = self._home_pos + (np.asarray(grip_pos, dtype=float) - self._origin_pos)
+    def rebase(
+        self, grip_pos: np.ndarray, grip_quat: np.ndarray, motion_scale: float = 1.0
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return the absolute base-frame EE target ``(pos [m], quat [xyzw])`` for this frame.
+
+        ``motion_scale`` multiplies the POSITION delta from the engage origin (< 1 =
+        precision mode, > 1 = coarse/fast mode); orientation stays 1:1 — scaled rotations
+        feel disorienting and the wrist has its own limits. Changing the scale mid-engage
+        is safe: the delta is recomputed from the latched origin each frame, so the target
+        moves smoothly to the rescaled position (no jump on the scale-change frame beyond
+        the rescaled delta itself, which the downstream rate limiter bounds).
+        """
+        scale = float(motion_scale)
+        if not np.isfinite(scale) or scale <= 0.0:
+            scale = 1.0
+        pos = self._home_pos + scale * (np.asarray(grip_pos, dtype=float) - self._origin_pos)
         rot_ctrl = Rotation.from_quat(np.asarray(grip_quat, dtype=float))
         rot = (rot_ctrl * self._origin_rot.inv()) * self._home_rot
         self._last_commanded_pos = pos.copy()

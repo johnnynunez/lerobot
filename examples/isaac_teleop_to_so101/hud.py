@@ -228,6 +228,25 @@ def render_hud(state: dict, fonts=None) -> np.ndarray:
         stateline = "ENGAGED" if engaged else "idle — squeeze the grip to engage"
         color = _SEVERITY_COLORS["ok"][1] if engaged else (170, 170, 170)
         draw.text((36, 116), stateline, font=fonts["body"], fill=color)
+        # Motion-scale chip (thumbstick up/down changes it): always visible so the
+        # operator can tell precision mode is on before wondering why the arm is "slow".
+        speed = _as_float(state.get("speed_scale"))
+        if speed is not None:
+            chip = f"x{speed:.2f}".rstrip("0").rstrip(".")
+            chip_w = draw.textlength(chip, font=fonts["body"])
+            cx0, cy0 = 36, 158
+            highlight = abs(speed - 1.0) > 1e-6  # non-1:1 scale deserves attention
+            chip_color = (255, 190, 80) if highlight else (150, 150, 150)
+            draw.rounded_rectangle(
+                [cx0 - 8, cy0 - 4, cx0 + chip_w + 8, cy0 + 30], radius=8, outline=chip_color, width=2
+            )
+            draw.text((cx0, cy0), chip, font=fonts["body"], fill=chip_color)
+            draw.text(
+                (cx0 + chip_w + 20, cy0 + 4),
+                "stick up/down = speed",
+                font=fonts["small"],
+                fill=(120, 120, 120, 255),
+            )
         _draw_heading_compass(
             draw,
             fonts,
@@ -236,7 +255,7 @@ def render_hud(state: dict, fonts=None) -> np.ndarray:
             engaged=engaged,
             accent=accent,
         )
-        y = 180
+        y = 210
         for label, value in (("squeeze", state.get("squeeze")), ("trigger", state.get("trigger"))):
             frac = _as_float(value)
             if frac is None:
