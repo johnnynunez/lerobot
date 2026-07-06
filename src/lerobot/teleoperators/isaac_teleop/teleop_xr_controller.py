@@ -265,6 +265,9 @@ class XRController(IsaacTeleopTeleoperator):
         controller = result["controller"]
         grip_pos = np.zeros(3, dtype=np.float32)
         grip_quat = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+        aim_pos = np.zeros(3, dtype=np.float32)
+        aim_quat = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+        aim_valid = False
         squeeze = 0.0
         trigger = 0.0
         thumb_x = 0.0
@@ -279,6 +282,12 @@ class XRController(IsaacTeleopTeleoperator):
             try:
                 grip_pos = np.asarray(controller[ControllerInputIndex.GRIP_POSITION], dtype=np.float32)
                 grip_quat = np.asarray(controller[ControllerInputIndex.GRIP_ORIENTATION], dtype=np.float32)
+                # Aim pose: OpenXR's pointing frame (the "laser pointer" origin/direction,
+                # -Z forward), rebased into the robot base frame by ControllerTransform
+                # exactly like the grip pose. Consumers raycast it for aiming UI.
+                aim_pos = np.asarray(controller[ControllerInputIndex.AIM_POSITION], dtype=np.float32)
+                aim_quat = np.asarray(controller[ControllerInputIndex.AIM_ORIENTATION], dtype=np.float32)
+                aim_valid = float(controller[ControllerInputIndex.AIM_IS_VALID]) > 0.5
                 squeeze = float(controller[ControllerInputIndex.SQUEEZE_VALUE])
                 trigger = float(controller[ControllerInputIndex.TRIGGER_VALUE])
                 thumb_x = float(controller[ControllerInputIndex.THUMBSTICK_X])
@@ -298,6 +307,9 @@ class XRController(IsaacTeleopTeleoperator):
         return {
             "grip_pos": grip_pos,
             "grip_quat": grip_quat,
+            "aim_pos": aim_pos,
+            "aim_quat": aim_quat,
+            "aim_valid": aim_valid,
             "squeeze": squeeze,
             "trigger": trigger,
             "thumbstick_x": thumb_x,

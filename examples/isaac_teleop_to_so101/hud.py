@@ -74,6 +74,15 @@ PANEL_DISTANCE_M = 1.15
 PANEL_Y_OFFSET_M = -0.12
 PANEL_WIDTH_M = 0.62
 
+# Aim laser-dot layer: a small quad laid flat on the table plane at the point the
+# controller's aim ray hits (the operator's "where am I pointing" endpoint). Its
+# anchor-frame pose arrives precomputed in the `aim_dot` field of teleop states;
+# when hidden the quad parks far underground instead of being detached (cheaper
+# than add/remove per frame, invisible behind the guardian floor).
+DOT_PX = 64
+DOT_SIZE_M = 0.035
+DOT_PARK_POSE = ((0.0, -100.0, 0.0), (1.0, 0.0, 0.0, 0.0))
+
 # Lazy re-anchor policy: glide to a new anchor when the head has turned this far away
 # from the panel bearing (or moved this far), after a short dwell so quick glances
 # don't drag the panel around.
@@ -443,6 +452,20 @@ class LazyFollow:
 # ---------------------------------------------------------------------------- server
 
 
+def _render_dot() -> np.ndarray:
+    """The laser-dot texture: a soft green disc with a bright core, alpha-feathered."""
+    yy, xx = np.mgrid[0:DOT_PX, 0:DOT_PX].astype(float)
+    c = (DOT_PX - 1) / 2.0
+    r = np.sqrt((xx - c) ** 2 + (yy - c) ** 2) / c  # 0 at center, 1 at edge
+    rgba = np.zeros((DOT_PX, DOT_PX, 4), dtype=np.uint8)
+    core = np.clip(1.0 - r * 1.4, 0.0, 1.0)  # bright core fading out
+    rgba[..., 0] = (90 + 120 * core).astype(np.uint8)
+    rgba[..., 1] = 255
+    rgba[..., 2] = (90 + 120 * core).astype(np.uint8)
+    rgba[..., 3] = (np.clip(1.0 - r, 0.0, 1.0) ** 0.7 * 255).astype(np.uint8)
+    return rgba
+
+
 def _serve(mode: str) -> int:
     """Own an OpenXR/window/offscreen viz session; render states arriving on stdin."""
     import isaacteleop.viz as viz
@@ -468,6 +491,16 @@ def _serve(mode: str) -> int:
     layer_cfg.format = viz.PixelFormat.kRGBA8
     layer = session.add_quad_layer(layer_cfg)
 
+    # Laser-dot layer: texture submitted once, pose moved per frame from the state's
+    # precomputed anchor-frame aim_dot (parked underground while there is no hit).
+    dot_cfg = viz.QuadLayerConfig()
+    dot_cfg.name = "so101_hud_aim_dot"
+    dot_cfg.resolution = viz.Resolution(DOT_PX, DOT_PX)
+    dot_cfg.format = viz.PixelFormat.kRGBA8
+    dot_layer = session.add_quad_layer(dot_cfg)
+    dot_layer.submit(torch.from_numpy(_render_dot()).cuda())
+    dot_layer.set_placement(viz.QuadLayerPlacement(viz.Pose3D(*DOT_PARK_POSE), (DOT_SIZE_M, DOT_SIZE_M)))
+
     fonts = _load_fonts()
     follow = LazyFollow()
     panel_size = (PANEL_WIDTH_M, PANEL_WIDTH_M * PANEL_H / PANEL_W)
@@ -475,6 +508,7 @@ def _serve(mode: str) -> int:
     state: dict = {"phase": "connect", "instruction": "Waiting for the teleop loop…"}
     state_version = 0
     rendered_version = -1
+    rendered_fingerprint: str | None = None
     lock = threading.Lock()
     stop = threading.Event()
 
@@ -503,8 +537,31 @@ def _serve(mode: str) -> int:
         with lock:
             current, version = state, state_version
         if version != rendered_version:
-            frame = torch.from_numpy(render_hud(current, fonts)).cuda()
-            layer.submit(frame)
+            # Split the panel render from the dot placement: the dot moves at aiming
+            # rate (many updates/s), re-rendering the 800x450 PIL panel for each would
+            # burn CPU for identical pixels. Only re-render when the panel fields changed.
+            dot = current.get("aim_dot")
+            panel_state = {k: v for k, v in current.items() if k != "aim_dot"}
+            fingerprint = json.dumps(panel_state, sort_keys=True, separators=(",", ":"))
+            if fingerprint != rendered_fingerprint:
+                layer.submit(torch.from_numpy(render_hud(panel_state, fonts)).cuda())
+                rendered_fingerprint = fingerprint
+            # Laser dot: `aim_dot` = {"pos": [x,y,z], "quat_wxyz": [w,x,y,z]} in the
+            # anchor frame, precomputed by the teleop loop; absent/None = no hit -> park.
+            try:
+                if dot:
+                    dot_layer.set_placement(
+                        viz.QuadLayerPlacement(
+                            viz.Pose3D(tuple(dot["pos"]), tuple(dot["quat_wxyz"])),
+                            (DOT_SIZE_M, DOT_SIZE_M),
+                        )
+                    )
+                else:
+                    dot_layer.set_placement(
+                        viz.QuadLayerPlacement(viz.Pose3D(*DOT_PARK_POSE), (DOT_SIZE_M, DOT_SIZE_M))
+                    )
+            except (KeyError, TypeError, ValueError):
+                pass  # malformed aim_dot: keep the previous placement (best-effort HUD)
             rendered_version = version
         if session.is_xr_mode():
             head = session.head_pose_now()

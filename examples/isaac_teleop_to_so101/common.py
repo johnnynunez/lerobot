@@ -70,6 +70,7 @@ from lerobot.utils.constants import HF_LEROBOT_CALIBRATION, HF_LEROBOT_HOME, TEL
 from lerobot.utils.robot_utils import precise_sleep
 
 try:
+    from .aim import aim_ray, base_point_to_anchor, plane_up_in_anchor, quat_wxyz_z_to, ray_plane_hit
     from .hud import HudClient
     from .preflight import (
         PreflightConfig,
@@ -79,6 +80,7 @@ try:
         run_blocking,
     )
 except ImportError:  # run directly as a script (no parent package)
+    from aim import aim_ray, base_point_to_anchor, plane_up_in_anchor, quat_wxyz_z_to, ray_plane_hit
     from hud import HudClient
     from preflight import (
         PreflightConfig,
@@ -462,6 +464,9 @@ def setup_xr(cfg: LoopConfig, robot, motor_names: list[str]) -> Device:
     # Runtime motion-scale selector state (thumbstick flick up/down; see SPEED_STEPS).
     speed_idx = SPEED_DEFAULT_IDX
     thumb_armed = True
+    # Last full 1 Hz HUD panel snapshot; per-frame aim-dot sends merge into it so the
+    # HUD server's panel fingerprint stays stable while only the dot pose changes.
+    last_hud_panel: dict | None = None
 
     def _apply_yaw_alignment() -> None:
         """Yaw-align base_T_anchor with the preflight move direction (operator's forward).
@@ -557,6 +562,7 @@ def setup_xr(cfg: LoopConfig, robot, motor_names: list[str]) -> Device:
 
     def compute(robot_obs: RobotObservation | None) -> RobotAction | None:
         nonlocal prev_enabled, tracking_lost_since, last_status_t, speed_idx, thumb_armed
+        nonlocal last_hud_panel
         assert clutch is not None  # set in startup(), which runs before compute()
         xr_action = teleop_device.get_action()
         tracking = teleop_device.is_tracking
@@ -695,7 +701,32 @@ def setup_xr(cfg: LoopConfig, robot, motor_names: list[str]) -> Device:
                 line += f" | target leads arm {lead * 100:.1f} cm"
                 hud_state["lead_cm"] = round(lead * 100, 1)
             print(line, flush=True)
-            _hud_send(hud_state)
+            last_hud_panel = hud_state
+
+        # AIM LASER DOT (every trusted frame, not just the 1 Hz snapshot): raycast the
+        # controller's aim pose (-Z, the OS pointer ray) onto the table plane (z=0 in
+        # the robot base frame) and ship the hit as an anchor-frame quad pose. The dot
+        # pose rides on the last panel snapshot so the HUD server re-renders the 800x450
+        # panel only when panel fields change while the dot moves at aiming rate.
+        if last_hud_panel is not None:
+            aim_dot = None
+            if bool(xr_action.get("aim_valid", False)):
+                origin, direction = aim_ray(
+                    np.asarray(xr_action["aim_pos"], dtype=float),
+                    np.asarray(xr_action["aim_quat"], dtype=float),
+                )
+                hit_base = ray_plane_hit(origin, direction)
+                if hit_base is not None:
+                    anchor_m = np.asarray(teleop_config.base_T_anchor, dtype=float)
+                    pos_anchor = base_point_to_anchor(anchor_m, hit_base)
+                    quat_wxyz = quat_wxyz_z_to(plane_up_in_anchor(anchor_m))
+                    # Millimeter rounding: enough precision, and HudClient's dedupe
+                    # drops frames where the dot did not visibly move.
+                    aim_dot = {
+                        "pos": [round(float(v), 3) for v in pos_anchor],
+                        "quat_wxyz": [round(float(v), 4) for v in quat_wxyz],
+                    }
+            _hud_send({**last_hud_panel, "aim_dot": aim_dot})
 
         # SAFETY GATE: command the robot ONLY while the clutch is engaged; otherwise return
         # None so the loop holds the measured joints (releasing the clutch freezes the arm).
